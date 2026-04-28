@@ -95,6 +95,10 @@ class DeployCommand(Command):
         if stack_arg:
             # Deploy specific stack
             if stack_arg == "auth":
+                if not getattr(profile, "sso_enabled", True):
+                    console.print("[yellow]SSO authentication is disabled in your configuration.[/yellow]")
+                    console.print("Enable it by running: [cyan]poetry run ccwb init[/cyan]")
+                    return 1
                 stacks_to_deploy.append(("auth", "Authentication Stack (Cognito + IAM)"))
             elif stack_arg == "networking":
                 if profile.monitoring_enabled:
@@ -111,6 +115,12 @@ class DeployCommand(Command):
             elif stack_arg == "dashboard":
                 if profile.monitoring_enabled:
                     stacks_to_deploy.append(("dashboard", "CloudWatch Dashboard"))
+                else:
+                    console.print("[yellow]Monitoring is not enabled in your configuration.[/yellow]")
+                    return 1
+            elif stack_arg == "cowork-dashboard":
+                if profile.monitoring_enabled:
+                    stacks_to_deploy.append(("cowork-dashboard", "CoWork CloudWatch Dashboard"))
                 else:
                     console.print("[yellow]Monitoring is not enabled in your configuration.[/yellow]")
                     return 1
@@ -148,14 +158,16 @@ class DeployCommand(Command):
             else:
                 console.print(f"[red]Unknown stack: {stack_arg}[/red]")
                 console.print(
-                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, analytics, quota, codebuild\n"
+                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, cowork-dashboard, analytics, quota, codebuild\n"
                 )
                 console.print("[dim]Tip: Use 'ccwb deploy' without arguments to deploy all enabled stacks.[/dim]")
                 console.print("[dim]Use 'ccwb deploy quota' for quota-specific updates or late enablement.[/dim]")
                 return 1
         else:
             # Deploy all configured stacks in dependency order
-            stacks_to_deploy.append(("auth", "Authentication Stack (Cognito + IAM)"))
+            # Only deploy auth stack if SSO is enabled (default: True for backward compatibility)
+            if getattr(profile, "sso_enabled", True):
+                stacks_to_deploy.append(("auth", "Authentication Stack (Cognito + IAM)"))
 
             # Deploy distribution after networking if it's landing-page type
             if profile.enable_distribution:
@@ -169,6 +181,7 @@ class DeployCommand(Command):
                 stacks_to_deploy.append(("s3bucket", "S3 Bucket"))
                 stacks_to_deploy.append(("monitoring", "OpenTelemetry Collector"))
                 stacks_to_deploy.append(("dashboard", "CloudWatch Dashboard"))
+                stacks_to_deploy.append(("cowork-dashboard", "CoWork CloudWatch Dashboard"))
                 # Check if analytics is enabled (default to True for backward compatibility)
                 if getattr(profile, "analytics_enabled", True):
                     stacks_to_deploy.append(("analytics", "Analytics Pipeline (Kinesis Firehose + Athena)"))
@@ -419,10 +432,16 @@ class DeployCommand(Command):
                         ]
                     )
 
+                # Use profile regions, or fall back to all known Bedrock regions
+                bedrock_regions = profile.allowed_bedrock_regions
+                if not bedrock_regions:
+                    from claude_code_with_bedrock.models import get_all_bedrock_regions
+                    bedrock_regions = [r for r in get_all_bedrock_regions() if "gov" not in r]
+
                 params.extend(
                     [
                         f"IdentityPoolName={profile.identity_pool_name}",
-                        f"AllowedBedrockRegions={','.join(profile.allowed_bedrock_regions)}",
+                        f"AllowedBedrockRegions={','.join(bedrock_regions)}",
                         f"EnableMonitoring={str(profile.monitoring_enabled).lower()}",
                     ]
                 )
@@ -720,6 +739,19 @@ class DeployCommand(Command):
                         except Exception:
                             pass
 
+            elif stack_type == "cowork-dashboard":
+                template = project_root / "deployment" / "infrastructure" / "cowork-dashboard.yaml"
+                stack_name = profile.stack_names.get(
+                    "cowork-dashboard", f"{profile.identity_pool_name}-cowork-dashboard"
+                )
+                params = [
+                    f"MetricsLogGroup={profile.metrics_log_group}",
+                    f"MetricsRegion={profile.aws_region}",
+                ]
+                return deploy_with_cf(
+                    template, stack_name, params, task_description="Deploying CoWork dashboard..."
+                )
+
             elif stack_type == "analytics":
                 template = project_root / "deployment" / "infrastructure" / "analytics-pipeline.yaml"
                 stack_name = profile.stack_names.get("analytics", f"{profile.identity_pool_name}-analytics")
@@ -772,18 +804,30 @@ class DeployCommand(Command):
                 )
 
                 # Get OIDC configuration for JWT authentication
-                # Cognito User Pool issuer URL is different from the hosted UI domain
-                if profile.provider_type == "cognito" and profile.cognito_user_pool_id:
-                    oidc_issuer_url = f"https://cognito-idp.{profile.aws_region}.amazonaws.com/{profile.cognito_user_pool_id}"
+                if profile.provider_type == "cognito":
+                    # Cognito issuer uses cognito-idp endpoint, not the hosted UI domain
+                    pool_id = getattr(profile, "cognito_user_pool_id", "")
+                    if pool_id:
+                        pool_region = pool_id.split("_")[0] if "_" in pool_id else profile.aws_region
+                        oidc_issuer_url = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
+                    else:
+                        raise ValueError(
+                            "Cognito User Pool ID is required for quota monitoring JWT authentication. "
+                            "Please set cognito_user_pool_id in your profile configuration."
+                        )
                 else:
                     oidc_issuer_url = profile.provider_domain
                     # Ensure issuer URL has https:// prefix
                     if oidc_issuer_url and not oidc_issuer_url.startswith(("http://", "https://")):
                         oidc_issuer_url = f"https://{oidc_issuer_url}"
-                    # Auth0 tokens include trailing slash in iss claim, so authorizer must match
-                    if profile.provider_type == "auth0" and oidc_issuer_url and not oidc_issuer_url.endswith("/"):
-                        oidc_issuer_url = f"{oidc_issuer_url}/"
+                # Auth0 tokens include trailing slash in iss claim, so authorizer must match
+                if profile.provider_type == "auth0" and oidc_issuer_url and not oidc_issuer_url.endswith("/"):
+                    oidc_issuer_url = f"{oidc_issuer_url}/"
                 oidc_client_id = profile.client_id
+
+                # Pass explicitly so the profile is the source of truth; the CF template
+                # default is 'false' to match the opt-in intent of this field.
+                enable_finegrained_quotas = profile.enable_finegrained_quotas
 
                 params = [
                     f"MonthlyTokenLimit={monthly_limit}",
@@ -796,6 +840,7 @@ class DeployCommand(Command):
                     f"MonthlyEnforcementMode={monthly_enforcement}",
                     f"OidcIssuerUrl={oidc_issuer_url}",
                     f"OidcClientId={oidc_client_id}",
+                    f"EnableFinegrainedQuotas={str(enable_finegrained_quotas).lower()}",
                 ]
 
                 # Package the template using AWS CLI

@@ -184,6 +184,18 @@ class TestCommand(Command):
             # Display configuration
             console.print("\n[bold]Configuration:[/bold]")
             console.print(f"[dim]  - Provider: {profile_config.get('provider_domain', 'unknown')}[/dim]")
+
+            # Display Azure AD authentication mode if applicable
+            if profile_config.get("provider_type") == "azure":
+                azure_auth_mode = profile_config.get("azure_auth_mode", "public")
+                if azure_auth_mode == "certificate":
+                    auth_mode_display = "Certificate (confidential client)"
+                elif azure_auth_mode == "secret":
+                    auth_mode_display = "Client Secret (confidential client — secret in OS keyring)"
+                else:
+                    auth_mode_display = "Public client"
+                console.print(f"[dim]  - Azure Auth Mode: {auth_mode_display}[/dim]")
+
             console.print(f"[dim]  - AWS Region: {profile_config.get('aws_region', 'unknown')}[/dim]")
 
             # Check credential storage
@@ -863,6 +875,12 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)[:50]}
 
+    @staticmethod
+    def _get_fallback_test_model() -> str:
+        """Get a fallback test model using the cheapest available model."""
+        from claude_code_with_bedrock.models import resolve_model_for_tier
+        return resolve_model_for_tier("haiku", "us") or "anthropic.claude-haiku-4-5-20251001-v1:0"
+
     def _test_model_invocation(self, profile_name: str, region: str, selected_model: str = None) -> dict:
         """Test actual model invocation using the configured inference profile."""
         try:
@@ -1206,7 +1224,7 @@ class TestCommand(Command):
                         "bedrock-runtime",
                         "invoke-model",
                         "--model-id",
-                        selected_model or "anthropic.claude-haiku-4-5-20251001-v1:0",
+                        selected_model or self._get_fallback_test_model(),
                         "--body",
                         f"fileb://{body_file}",
                         "--content-type",

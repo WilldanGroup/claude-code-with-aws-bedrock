@@ -28,6 +28,8 @@ This document provides a complete reference for all `ccwb` (Claude Code with Bed
     - [`quota unblock` - Unblock User](#quota-unblock---unblock-user)
     - [`quota export` - Export Policies](#quota-export---export-policies)
     - [`quota import` - Import Policies](#quota-import---import-policies)
+  - [Claude Cowork 3P](#claude-cowork-3p)
+    - [`cowork generate` - Generate MDM Configuration](#cowork-generate---generate-mdm-configuration)
   - [Profile Management](#profile-management)
     - [`context list` - List All Profiles](#context-list---list-all-profiles)
     - [`context current` - Show Active Profile](#context-current---show-active-profile)
@@ -325,6 +327,49 @@ This ensures that packaging always works, even if some optional platforms are no
 - Includes Claude Code telemetry settings (if monitoring enabled)
 - Configures environment variables for model selection (ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL)
 
+**Credential process binary flags (for end users):**
+
+The distributed `credential-process` binary accepts the following flags directly:
+
+| Flag | Description |
+|---|---|
+| `--profile, -p <name>` | Profile to use (default: `ClaudeCode`, or `$CCWB_PROFILE`) |
+| `--clear-cache` | Clear cached credentials and force re-authentication |
+| `--check-expiration` | Exit 0 if credentials valid, 1 if expired |
+| `--refresh-if-needed` | Refresh credentials if expired (session storage mode only) |
+| `--get-monitoring-token` | Return cached OIDC monitoring token |
+| `--set-client-secret` | Store Azure AD client secret in OS secure storage. Uses an interactive prompt by default; set `CCWB_CLIENT_SECRET` env var for non-interactive use. Press Enter at the prompt (or set the env var to an empty string) to clear the stored secret. |
+
+**`--set-client-secret` usage examples:**
+
+```bash
+# Interactive (prompts for secret):
+~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+
+# Non-interactive (MDM/scripted deployment) — avoids secret appearing in shell history:
+CCWB_CLIENT_SECRET=<your-client-secret> ~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+
+# Clear a stored secret:
+~/claude-code-with-bedrock/credential-process --set-client-secret --profile ClaudeCode
+# (press Enter without typing a value)
+```
+
+**Certificate path environment variables (confidential client — certificate mode):**
+
+When certificate paths recorded in `config.json` are absolute, they may not resolve on end-user machines with a different install layout. Set these env vars to override the paths stored in `config.json` at runtime:
+
+| Environment variable | Description |
+|---|---|
+| `AZURE_CLIENT_CERTIFICATE_PATH` | Path to the PEM certificate file. Overrides `client_certificate_path` in `config.json`. |
+| `AZURE_CLIENT_CERTIFICATE_KEY_PATH` | Path to the PEM private key file. Overrides `client_certificate_key_path` in `config.json`. |
+
+```bash
+# Override certificate paths (e.g. via MDM launch agent environment):
+AZURE_CLIENT_CERTIFICATE_PATH=~/certs/cert.pem \
+AZURE_CLIENT_CERTIFICATE_KEY_PATH=~/certs/key.pem \
+~/claude-code-with-bedrock/credential-process --profile ClaudeCode
+```
+
 **Output structure:**
 
 ```
@@ -541,6 +586,60 @@ poetry run ccwb cleanup [options]
 - Clean up after testing
 - Remove failed installations
 - Start fresh with a new configuration
+
+## Claude Cowork 3P
+
+### `cowork generate` - Generate MDM Configuration
+
+Generate Claude Cowork 3P MDM configuration files for deploying Claude Desktop with Amazon Bedrock as the inference backend.
+
+This command reads your existing deployment profile (region, model, monitoring stack) and generates ready-to-deploy MDM configuration files.
+
+```bash
+# Generate all formats (JSON, macOS .mobileconfig, Windows .reg)
+poetry run ccwb cowork generate
+
+# Generate specific format
+poetry run ccwb cowork generate --format mobileconfig
+poetry run ccwb cowork generate --format reg
+poetry run ccwb cowork generate --format json
+
+# Custom model aliases
+poetry run ccwb cowork generate --models opus,sonnet,haiku
+
+# Custom output directory
+poetry run ccwb cowork generate -o ./my-mdm-configs/
+
+# Specific profile
+poetry run ccwb cowork generate --profile Production
+
+# Custom credential helper TTL
+poetry run ccwb cowork generate --credential-helper-ttl 7200
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--profile` | Configuration profile to use | Active profile |
+| `--output`, `-o` | Output directory | `dist/cowork-3p/` |
+| `--format`, `-f` | Output format: `all`, `json`, `mobileconfig`, `reg` | `all` |
+| `--models`, `-m` | Comma-separated model aliases | Auto-detected from profile |
+| `--credential-helper-ttl` | Credential helper cache TTL (seconds) | `3600` |
+
+**Generated files:**
+
+| File | Platform | Description |
+|------|----------|-------------|
+| `cowork-3p-config.json` | All | Raw MDM configuration JSON (for Claude Desktop Setup UI import) |
+| `cowork-3p.mobileconfig` | macOS | MDM configuration profile (deploy via Jamf, Kandji, Mosyle) |
+| `cowork-3p.reg` | Windows | Registry file (deploy via Group Policy, Intune, SCCM) |
+
+**Automatic integration with `ccwb package`:**
+
+CoWork 3P configs are also auto-generated during `ccwb package` when enabled via `ccwb init`. Both paths use the same shared configuration logic to ensure identical output.
+
+See [CoWork 3P Guide](COWORK_3P.md) for detailed setup and deployment instructions.
 
 ## Quota Management
 

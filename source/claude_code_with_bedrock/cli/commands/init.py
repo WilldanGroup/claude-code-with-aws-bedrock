@@ -104,7 +104,7 @@ class InitCommand(Command):
 
         # If user explicitly chose "Update existing profile", skip the second prompt
         if existing_config and user_action == "update":
-            config = self._gather_configuration(progress, existing_config)
+            config = self._gather_configuration(progress, existing_config, profile_name)
             if not config:
                 return 1
             if not self._review_configuration(config):
@@ -145,7 +145,7 @@ class InitCommand(Command):
                 self._review_configuration(existing_config)
                 return 0
             elif action == "Update configuration":
-                config = self._gather_configuration(progress, existing_config)
+                config = self._gather_configuration(progress, existing_config, profile_name)
                 if not config:
                     return 1
                 if not self._review_configuration(config):
@@ -196,7 +196,7 @@ class InitCommand(Command):
             return 1
 
         # Gather configuration
-        config = self._gather_configuration(progress)
+        config = self._gather_configuration(progress, profile_name=profile_name)
         if not config:
             return 1
         # Review and confirm
@@ -267,7 +267,7 @@ class InitCommand(Command):
         console.print("")
         return True
 
-    def _gather_configuration(self, progress: WizardProgress, existing_config: dict[str, Any] = None) -> dict[str, Any]:
+    def _gather_configuration(self, progress: WizardProgress, existing_config: dict[str, Any] = None, profile_name: str | None = None) -> dict[str, Any]:
         """Gather configuration from user."""
         console = Console()
         # Use existing config as base if provided, otherwise use saved progress
@@ -291,9 +291,32 @@ class InitCommand(Command):
             skip_monitoring = last_step in ["monitoring_complete", "bedrock_complete"]
             skip_bedrock = last_step in ["bedrock_complete"]
 
-        # OIDC Provider Configuration
+        # SSO Authentication Configuration
         if not skip_okta:
-            console.print("\n[bold blue]Step 1: OIDC Provider Configuration[/bold blue]")
+            console.print("\n[bold blue]Step 1: Authentication Configuration[/bold blue]")
+            console.print("─" * 40)
+
+            console.print("\n[bold]SSO Authentication[/bold]")
+            console.print("Enable Single Sign-On authentication via identity providers")
+            console.print("(Okta, Auth0, Azure AD, AWS Cognito)")
+            console.print("\nWhen disabled:")
+            console.print("  • Uses AWS IAM roles for access control")
+            console.print("  • Metrics will use anonymous tracking based on IAM identity")
+            console.print("  • No user authentication required\n")
+
+            sso_enabled = questionary.confirm(
+                "Enable SSO authentication?",
+                default=config.get("sso_enabled", True),
+            ).ask()
+
+            if sso_enabled is None:
+                return None
+
+            config["sso_enabled"] = sso_enabled
+
+        # OIDC Provider Configuration
+        if not skip_okta and config.get("sso_enabled", True):
+            console.print("\n[bold blue]OIDC Provider Configuration[/bold blue]")
             console.print("─" * 30)
 
             provider_domain = questionary.text(
@@ -396,6 +419,76 @@ class InitCommand(Command):
 
             if not client_id:
                 return None
+
+            # Confidential client configuration (Azure AD / Entra ID only)
+            client_secret = None
+            client_certificate_path = None
+            client_certificate_key_path = None
+
+            if provider_type == "azure":
+                console.print("\n[bold]Azure AD Authentication Mode[/bold]")
+                console.print(
+                    "Some enterprise Entra ID tenants disable public client flows.\n"
+                    "If yours does, configure a confidential client here.\n"
+                )
+
+                auth_mode = questionary.select(
+                    "Select authentication mode:",
+                    choices=[
+                        questionary.Choice("Public client (default, no secret required)", value="public"),
+                        questionary.Choice("Confidential client — client secret", value="secret"),
+                        questionary.Choice("Confidential client — certificate (recommended for enterprise)", value="certificate"),
+                    ],
+                    default=config.get("azure_auth_mode", "public"),
+                ).ask()
+
+                if not auth_mode:
+                    return None
+
+                if auth_mode == "secret":
+                    client_secret = questionary.password(
+                        "Enter your client secret:",
+                        validate=lambda x: bool(x) or "Client secret cannot be empty",
+                    ).ask()
+                    if not client_secret:
+                        return None
+                    if not profile_name:
+                        raise ValueError("profile_name is required to store client secret in keyring")
+                    import keyring as _keyring
+                    _keyring.set_password("claude-code-with-bedrock", f"{profile_name}-client-secret", client_secret)
+                    console.print("[dim]  ✓ Client secret stored in OS secure storage (not written to config)[/dim]")
+                    console.print(
+                        "[dim]  Distribute to end users: they must run[/dim]\n"
+                        "[dim]    credential-process --set-client-secret --profile <profile>[/dim]\n"
+                        "[dim]  to store the secret on their machine.[/dim]"
+                    )
+
+                elif auth_mode == "certificate":
+                    console.print(
+                        "\n[dim]Generate a self-signed cert with:[/dim]\n"
+                        "[dim]  openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes[/dim]\n"
+                        "[dim]Then upload cert.pem to your app registration → Certificates & secrets.[/dim]\n"
+                    )
+                    client_certificate_path = questionary.text(
+                        "Path to certificate PEM file:",
+                        validate=lambda x: bool(x) or "Certificate path cannot be empty",
+                        default=config.get("client_certificate_path", ""),
+                    ).ask()
+                    if not client_certificate_path:
+                        return None
+
+                    client_certificate_key_path = questionary.text(
+                        "Path to private key PEM file:",
+                        validate=lambda x: bool(x) or "Key path cannot be empty",
+                        default=config.get("client_certificate_key_path", ""),
+                    ).ask()
+                    if not client_certificate_key_path:
+                        return None
+
+                config["azure_auth_mode"] = auth_mode
+                # client_secret is never written to config — it lives in the OS keyring
+                config["client_certificate_path"] = client_certificate_path
+                config["client_certificate_key_path"] = client_certificate_key_path
 
             # Credential Storage Method
             console.print("\n[bold]Credential Storage Method[/bold]")
@@ -768,6 +861,22 @@ class InitCommand(Command):
         if enable_codebuild:
             console.print("[green]✓[/green] CodeBuild for Windows builds will be deployed")
 
+        # Claude Cowork 3P MDM configuration
+        console.print("\n[bold]Claude Cowork (Desktop) Support[/bold]")
+        console.print("Generate MDM configuration for Claude Cowork with third-party platforms")
+        console.print("Enables Claude Desktop to use the same credential helper for Amazon Bedrock")
+        enable_cowork = questionary.confirm(
+            "Generate CoWork 3P MDM configuration during packaging?",
+            default=config.get("cowork_3p", {}).get("enabled", True),
+        ).ask()
+
+        if "cowork_3p" not in config:
+            config["cowork_3p"] = {}
+        config["cowork_3p"]["enabled"] = enable_cowork
+
+        if enable_cowork:
+            console.print("[green]✓[/green] CoWork 3P configs will be generated during packaging")
+
         # Package distribution support
         console.print("\n[bold]Package Distribution[/bold]")
         console.print("Choose how to distribute Claude Code packages to end users:")
@@ -1095,8 +1204,8 @@ class InitCommand(Command):
             for profile_key in available_profiles:
                 # Get model-specific description
                 description = get_profile_description(selected_model_key, profile_key)
-                profile_name = profile_key.upper() if profile_key != "us" else "US"
-                choice_text = f"{profile_name} Cross-Region - {description}"
+                region_profile_label = profile_key.upper() if profile_key != "us" else "US"
+                choice_text = f"{region_profile_label} Cross-Region - {description}"
                 profile_choices.append(questionary.Choice(title=choice_text, value=profile_key))
 
             # Adjust the prompt based on number of options
@@ -1133,8 +1242,8 @@ class InitCommand(Command):
             config["aws"]["allowed_bedrock_regions"] = destination_regions
 
             # Step 3: Select source region for the selected model/profile combination
-            profile_name = selected_profile.upper() if selected_profile != "us" else "US"
-            console.print(f"\n[green]Selected:[/green] {profile_name} Cross-Region")
+            region_profile_label = selected_profile.upper() if selected_profile != "us" else "US"
+            console.print(f"\n[green]Selected:[/green] {region_profile_label} Cross-Region")
 
             # Get available source regions for this model/profile combination
             available_source_regions = get_source_regions_for_model_profile(selected_model_key, selected_profile)
@@ -1182,7 +1291,7 @@ class InitCommand(Command):
             profile_description = get_profile_description(selected_model_key, selected_profile)
 
             console.print(
-                f"\n[green]✓[/green] Configured {selected_model['name']} with {profile_name} "
+                f"\n[green]✓[/green] Configured {selected_model['name']} with {region_profile_label} "
                 f"Cross-Region ({profile_description})"
             )
 
@@ -1256,16 +1365,8 @@ class InitCommand(Command):
 
         # Show selected model
         selected_model = config["aws"].get("selected_model", "")
-        model_display = {
-            "global.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (Global)",
-            "us.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6",
-            "eu.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (EU)",
-            "au.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (AU)",
-            "us.anthropic.claude-opus-4-1-20250805-v1:0": "Claude Opus 4.1",
-            "us.anthropic.claude-opus-4-20250514-v1:0": "Claude Opus 4",
-            "us.anthropic.claude-3-7-sonnet-20250219-v1:0": "Claude 3.7 Sonnet",
-            "us.anthropic.claude-sonnet-4-20250514-v1:0": "Claude Sonnet 4",
-        }
+        from claude_code_with_bedrock.models import get_all_model_display_names
+        model_display = get_all_model_display_names()
         if selected_model:
             table.add_row("Claude Model", model_display.get(selected_model, selected_model))
 
@@ -1445,10 +1546,15 @@ class InitCommand(Command):
         if monitoring_dict.get("hosted_zone_id"):
             monitoring_config["hosted_zone_id"] = monitoring_dict["hosted_zone_id"]
 
+        # Get SSO configuration or use defaults if SSO is disabled
+        sso_enabled = config_data.get("sso_enabled", True)
+        provider_domain = config_data.get("okta", {}).get("domain", "none") if sso_enabled else "none"
+        client_id = config_data.get("okta", {}).get("client_id", "none") if sso_enabled else "none"
+
         profile = Profile(
             name=profile_name,
-            provider_domain=config_data["okta"]["domain"],
-            client_id=config_data["okta"]["client_id"],
+            provider_domain=provider_domain,
+            client_id=client_id,
             credential_storage=config_data.get("credential_storage", "session"),
             aws_region=config_data["aws"]["region"],
             identity_pool_name=config_data["aws"]["identity_pool_name"],
@@ -1468,6 +1574,10 @@ class InitCommand(Command):
             cognito_user_pool_id=config_data.get("cognito_user_pool_id"),
             federation_type=config_data.get("federation_type", "cognito"),
             max_session_duration=config_data.get("max_session_duration", 28800),
+            sso_enabled=config_data.get("sso_enabled", True),
+            azure_auth_mode=config_data.get("azure_auth_mode"),
+            client_certificate_path=config_data.get("client_certificate_path"),
+            client_certificate_key_path=config_data.get("client_certificate_key_path"),
             enable_codebuild=config_data.get("codebuild", {}).get("enabled", False),
             enable_distribution=config_data.get("distribution", {}).get("enabled", False),
             distribution_type=config_data.get("distribution", {}).get("type"),
@@ -1490,6 +1600,7 @@ class InitCommand(Command):
             daily_enforcement_mode=config_data.get("quota", {}).get("daily_enforcement_mode", "alert"),
             monthly_enforcement_mode=config_data.get("quota", {}).get("monthly_enforcement_mode", "block"),
             quota_check_interval=config_data.get("quota", {}).get("check_interval", 30),
+            cowork_3p_enabled=config_data.get("cowork_3p", {}).get("enabled", True),
         )
 
         config.add_profile(profile)
@@ -1775,6 +1886,9 @@ class InitCommand(Command):
             if hasattr(profile, "enable_codebuild"):
                 existing_config["codebuild"] = {"enabled": profile.enable_codebuild}
 
+            # Add CoWork 3P configuration
+            existing_config["cowork_3p"] = {"enabled": profile.cowork_3p_enabled}
+
             # Add distribution configuration if present
             if hasattr(profile, "enable_distribution"):
                 existing_config["distribution"] = {
@@ -1800,6 +1914,14 @@ class InitCommand(Command):
             # Add analytics configuration if present
             if hasattr(profile, "analytics_enabled"):
                 existing_config["analytics"] = {"enabled": profile.analytics_enabled}
+
+            # Preserve confidential client configuration if present
+            # client_secret is never written to config — it lives in the OS keyring
+            if getattr(profile, "azure_auth_mode", None):
+                existing_config["azure_auth_mode"] = profile.azure_auth_mode
+            if getattr(profile, "client_certificate_path", None):
+                existing_config["client_certificate_path"] = profile.client_certificate_path
+                existing_config["client_certificate_key_path"] = profile.client_certificate_key_path
 
             # Add selected source region if present
             if hasattr(profile, "selected_source_region") and profile.selected_source_region:
@@ -1830,16 +1952,8 @@ class InitCommand(Command):
         # Show selected model if present
         selected_model = config["aws"].get("selected_model")
         if selected_model:
-            model_names = {
-                "global.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (Global)",
-                "us.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6",
-                "eu.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (EU)",
-                "au.anthropic.claude-opus-4-6-v1": "Claude Opus 4.6 (AU)",
-                "us.anthropic.claude-opus-4-1-20250805-v1:0": "Claude Opus 4.1",
-                "us.anthropic.claude-opus-4-20250514-v1:0": "Claude Opus 4",
-                "us.anthropic.claude-3-7-sonnet-20250219-v1:0": "Claude 3.7 Sonnet",
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": "Claude Sonnet 4",
-            }
+            from claude_code_with_bedrock.models import get_all_model_display_names
+            model_names = get_all_model_display_names()
             console.print(f"• Claude Model: [cyan]{model_names.get(selected_model, selected_model)}[/cyan]")
 
         # Show cross-region profile

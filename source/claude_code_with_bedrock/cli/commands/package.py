@@ -338,7 +338,7 @@ class PackageCommand(Command):
         console.print("\n[cyan]Creating configuration...[/cyan]")
         # Pass the appropriate identifier based on federation type
         federation_identifier = federated_role_arn if federation_type == "direct" else identity_pool_id
-        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name)
+        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name, console)
 
         # Create installer
         console.print("[cyan]Creating installer script...[/cyan]")
@@ -363,6 +363,11 @@ class PackageCommand(Command):
         console.print("[cyan]Creating Claude Code settings...[/cyan]")
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name)
 
+        # Generate CoWork 3P MDM configuration if enabled
+        if profile.cowork_3p_enabled:
+            console.print("\n[cyan]Generating CoWork 3P MDM configuration...[/cyan]")
+            self._generate_cowork_3p_mdm_config(output_dir, profile, profile_name)
+
         # Summary
         console.print("\n[green]✓ Package created successfully![/green]")
         console.print(f"\nOutput directory: [cyan]{output_dir}[/cyan]")
@@ -383,6 +388,13 @@ class PackageCommand(Command):
             console.print("  • claude-settings/settings.json - Claude Code telemetry settings")
             for platform_name, otel_helper_path in built_otel_helpers:
                 console.print(f"  • {otel_helper_path.name} - OTEL helper executable for {platform_name}")
+        if profile.cowork_3p_enabled:
+            if (output_dir / "cowork-3p-config.json").exists():
+                console.print("  • cowork-3p-config.json - CoWork 3P MDM configuration (JSON)")
+            if (output_dir / "cowork-3p.mobileconfig").exists():
+                console.print("  • cowork-3p.mobileconfig - CoWork 3P MDM profile (macOS)")
+            if (output_dir / "cowork-3p.reg").exists():
+                console.print("  • cowork-3p.reg - CoWork 3P registry file (Windows)")
 
         # Next steps
         console.print("\n[bold]Distribution steps:[/bold]")
@@ -1669,6 +1681,7 @@ RUN pyinstaller \
         federation_identifier: str,
         federation_type: str = "cognito",
         profile_name: str = "ClaudeCode",
+        console=None,
     ) -> Path:
         """Create the configuration file.
 
@@ -1706,6 +1719,35 @@ RUN pyinstaller \
         # Add selected_model if available
         if hasattr(profile, "selected_model") and profile.selected_model:
             config[profile_name]["selected_model"] = profile.selected_model
+
+        # Add confidential client fields for Azure AD if present.
+        # client_secret is never written to config.json — it lives in the OS keyring.
+        # End users set it with: credential-process --set-client-secret --profile <profile>
+        if getattr(profile, "azure_auth_mode", None):
+            config[profile_name]["azure_auth_mode"] = profile.azure_auth_mode
+        if getattr(profile, "client_certificate_path", None):
+            config[profile_name]["client_certificate_path"] = profile.client_certificate_path
+            config[profile_name]["client_certificate_key_path"] = profile.client_certificate_key_path
+            # Warn if the paths are absolute — they are machine-specific and will not
+            # resolve on end-user machines with different install layouts.
+            cert_is_absolute = Path(profile.client_certificate_path).is_absolute()
+            key_is_absolute = Path(profile.client_certificate_key_path).is_absolute()
+            if (cert_is_absolute or key_is_absolute) and console:
+                console.print(
+                    "\n[yellow]Warning: certificate paths in config.json are absolute and will not "
+                    "resolve on machines where the files are stored elsewhere.[/yellow]"
+                )
+                console.print(
+                    "[yellow]Instruct end users to set the following environment variables:[/yellow]"
+                )
+                console.print("[dim]  AZURE_CLIENT_CERTIFICATE_PATH=<path/to/cert.pem>[/dim]")
+                console.print("[dim]  AZURE_CLIENT_CERTIFICATE_KEY_PATH=<path/to/key.pem>[/dim]\n")
+
+        # Add quota settings so the credential provider can enforce limits
+        if getattr(profile, "quota_api_endpoint", None):
+            config[profile_name]["quota_api_endpoint"] = profile.quota_api_endpoint
+            config[profile_name]["quota_fail_mode"] = getattr(profile, "quota_fail_mode", "open")
+            config[profile_name]["quota_check_interval"] = getattr(profile, "quota_check_interval", 30)
 
         config_path = output_dir / "config.json"
         with open(config_path, "w") as f:
@@ -1777,10 +1819,10 @@ echo
 # Check prerequisites
 echo "Checking prerequisites..."
 
-if ! command -v aws &> /dev/null; then
-    echo "❌ AWS CLI is not installed"
-    echo "   Please install from https://aws.amazon.com/cli/"
-    exit 1
+if command -v aws &> /dev/null; then
+    echo "✓ AWS CLI found (optional)"
+else
+    echo "ℹ  AWS CLI not found — not required. The credential process binary handles authentication directly."
 fi
 
 echo "✓ Prerequisites found"
@@ -1838,8 +1880,11 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
 
-# macOS Keychain Notice
+# macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
+    # Remove quarantine flag added by macOS when downloading unsigned binaries.
+    # Without this, Gatekeeper blocks execution with "Apple could not verify..." dialog.
+    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
     echo
     echo "⚠️  macOS Keychain Access:"
     echo "   On first use, macOS will ask for permission to access the keychain."
@@ -1887,6 +1932,7 @@ if [ -f "$OTEL_BINARY" ]; then
     # Install PyInstaller binary as otel-helper-bin (fallback for cache miss)
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
     chmod +x ~/claude-code-with-bedrock/otel-helper-bin
+    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper-bin 2>/dev/null || true
     # Install shell wrapper as otel-helper (fast cache check, avoids PyInstaller startup)
     if [ -f "otel-helper.sh" ]; then
         cp "otel-helper.sh" ~/claude-code-with-bedrock/otel-helper
@@ -2004,10 +2050,9 @@ echo Checking prerequisites...
 
 where aws >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: AWS CLI is not installed
-    echo        Please install from https://aws.amazon.com/cli/
-    pause
-    exit /b 1
+    echo INFO: AWS CLI not found -- not required. The credential process binary handles authentication directly.
+) else (
+    echo OK AWS CLI found [optional]
 )
 
 echo OK Prerequisites found
@@ -2318,6 +2363,11 @@ Available metrics include:
                     "CLAUDE_CODE_USE_BEDROCK": "1",
                     # AWS_PROFILE is used by both AWS SDK and otel-helper
                     "AWS_PROFILE": profile_name,
+                    # AWS_CREDENTIAL_PROCESS allows the AWS SDK to obtain credentials
+                    # directly without requiring the AWS CLI or ~/.aws/config.
+                    # The __CREDENTIAL_PROCESS_PATH__ placeholder is replaced by
+                    # install.sh/install.bat with the actual binary path at install time.
+                    "AWS_CREDENTIAL_PROCESS": f"__CREDENTIAL_PROCESS_PATH__ --profile {profile_name}",
                 }
             }
 
@@ -2334,15 +2384,25 @@ Available metrics include:
             if hasattr(profile, "selected_model") and profile.selected_model:
                 settings["env"]["ANTHROPIC_MODEL"] = profile.selected_model
 
-                # Determine and set small/fast model based on selected model family
-                if "opus" in profile.selected_model:
-                    # For Opus, use Haiku as small/fast model
-                    model_id = profile.selected_model
-                    prefix = model_id.split(".anthropic")[0]  # Get us/eu/apac prefix
-                    settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = f"{prefix}.anthropic.claude-3-5-haiku-20241022-v1:0"
-                else:
-                    # For other models, use same model as small/fast (or could use Haiku)
-                    settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = profile.selected_model
+                # Set all model tier env vars using the CRIS prefix from init.
+                # Claude Code uses these to resolve the correct CRIS-prefixed
+                # models for each tier (small/fast, default sonnet/opus/haiku).
+                # This ensures all tiers respect the admin's routing geography
+                # choice and works correctly with model aliases like 'opusplan'.
+                from claude_code_with_bedrock.models import resolve_model_for_tier
+                cris_prefix = getattr(profile, "cross_region_profile", None) or "us"
+
+                haiku_model = resolve_model_for_tier("haiku", cris_prefix)
+                sonnet_model = resolve_model_for_tier("sonnet", cris_prefix)
+                opus_model = resolve_model_for_tier("opus", cris_prefix)
+
+                if haiku_model:
+                    settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = haiku_model
+                    settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
+                if sonnet_model:
+                    settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
+                if opus_model:
+                    settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
 
             # If monitoring is enabled, add telemetry configuration
             if profile.monitoring_enabled:
@@ -2411,3 +2471,42 @@ Available metrics include:
 
         except Exception as e:
             console.print(f"[yellow]Warning: Could not create Claude Code settings: {e}[/yellow]")
+
+
+    def _generate_cowork_3p_mdm_config(
+        self,
+        output_dir: Path,
+        profile,
+        profile_name: str = "ClaudeCode",
+    ) -> None:
+        """Generate Claude Cowork 3P MDM configuration files.
+
+        Delegates to shared utilities in cli/utils/cowork_3p.py to ensure
+        consistency with the standalone 'ccwb cowork generate' command.
+        """
+        from claude_code_with_bedrock.cli.utils.cowork_3p import (
+            add_monitoring_config,
+            build_mdm_config,
+            derive_model_aliases,
+            generate_all,
+            generate_credential_helper_wrapper,
+        )
+
+        console = Console()
+
+        try:
+            bedrock_region = self._get_bedrock_region_for_profile(profile)
+            model_aliases = derive_model_aliases()
+
+            mdm_config = build_mdm_config(
+                bedrock_region=bedrock_region,
+                model_aliases=model_aliases,
+                profile_name=profile_name,
+            )
+
+            generate_credential_helper_wrapper(profile_name, bedrock_region)
+            add_monitoring_config(mdm_config, profile, console)
+            generate_all(output_dir, mdm_config, console)
+
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not generate CoWork 3P config: {e}[/yellow]")
