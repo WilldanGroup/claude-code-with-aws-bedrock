@@ -1,0 +1,227 @@
+name: Willdan build and release
+
+# Tag-driven release workflow for Willdan's distribution of claude-code-with-aws-bedrock.
+#
+# Trigger by pushing a tag matching `willdan-vX.Y.Z-N`, where:
+#   - vX.Y.Z is the upstream tag this fork is rebased on (e.g. v2.2.0)
+#   - N is the Willdan revision (incremented for Willdan-only changes between upstream releases)
+#
+# Each tag push runs `ccwb package` for every supported platform on a native runner,
+# then attaches the produced zips and raw binaries to a GitHub release for the tag.
+# Users (and CI consumers like nix flake inputs) then pull from the stable release URL
+# instead of per-user presigned S3 URLs.
+#
+# The build profile (Cognito IDs, OTEL endpoint, etc.) is read from
+# willdan/build-profile.json. That file is gitignored — populate it from repo secrets
+# in the "Generate build profile" step below, or check in a profile that uses public
+# tenant identifiers (Cognito client IDs are public values, not secrets).
+
+on:
+  push:
+    tags:
+      - 'willdan-v*-*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Skip the release/upload step (build only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # needed to create releases and upload assets
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-14
+            ccwb_platform: macos-arm64
+            zip_name: claude-code-package-darwin-arm64.zip
+            experimental: false
+          - target: macos-x86_64
+            runner: macos-13
+            ccwb_platform: macos-intel
+            zip_name: claude-code-package-darwin-x86_64.zip
+            experimental: false
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            ccwb_platform: linux-x64
+            zip_name: claude-code-package-linux-x86_64.zip
+            experimental: false
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            ccwb_platform: linux-arm64
+            zip_name: claude-code-package-linux-aarch64.zip
+            experimental: false
+          - target: windows-x86_64
+            runner: windows-latest
+            ccwb_platform: windows
+            zip_name: claude-code-package-windows-x86_64.zip
+            # Marked experimental: upstream's documented Windows path uses AWS CodeBuild +
+            # Nuitka. Trying PyInstaller on a stock windows-latest runner first; if it doesn't
+            # produce a working binary we fall back to the CodeBuild flow in a follow-up.
+            experimental: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Install dependencies
+        working-directory: source
+        run: poetry install --no-root
+
+      - name: Generate build profile
+        shell: bash
+        env:
+          # Each value is read from a repo secret. Set these in
+          # https://github.com/WilldanGroup/claude-code-with-aws-bedrock/settings/secrets/actions
+          # The names below are illustrative — match them to your actual secret names.
+          CCWB_NAME: ${{ secrets.CCWB_PROFILE_NAME || 'willdan' }}
+          CCWB_PROVIDER_DOMAIN: ${{ secrets.CCWB_PROVIDER_DOMAIN }}
+          CCWB_CLIENT_ID: ${{ secrets.CCWB_CLIENT_ID }}
+          CCWB_AWS_REGION: ${{ secrets.CCWB_AWS_REGION || 'us-east-1' }}
+          CCWB_IDENTITY_POOL_NAME: ${{ secrets.CCWB_IDENTITY_POOL_NAME }}
+          CCWB_COGNITO_USER_POOL_ID: ${{ secrets.CCWB_COGNITO_USER_POOL_ID }}
+          CCWB_PROVIDER_TYPE: ${{ secrets.CCWB_PROVIDER_TYPE || 'cognito' }}
+          CCWB_SELECTED_MODEL: ${{ secrets.CCWB_SELECTED_MODEL || 'us.anthropic.claude-sonnet-4-6' }}
+          CCWB_CROSS_REGION_PROFILE: ${{ secrets.CCWB_CROSS_REGION_PROFILE || 'us' }}
+        run: |
+          # If a checked-in profile exists, prefer it; otherwise generate from env.
+          if [ -f willdan/build-profile.json ]; then
+            echo "Using checked-in willdan/build-profile.json"
+          else
+            echo "Generating profile from repo secrets"
+            mkdir -p willdan
+            cat > willdan/build-profile.json <<EOF
+          {
+            "name": "${CCWB_NAME}",
+            "schema_version": "2.0",
+            "provider_domain": "${CCWB_PROVIDER_DOMAIN}",
+            "client_id": "${CCWB_CLIENT_ID}",
+            "credential_storage": "session",
+            "aws_region": "${CCWB_AWS_REGION}",
+            "identity_pool_name": "${CCWB_IDENTITY_POOL_NAME}",
+            "provider_type": "${CCWB_PROVIDER_TYPE}",
+            "cognito_user_pool_id": "${CCWB_COGNITO_USER_POOL_ID}",
+            "selected_model": "${CCWB_SELECTED_MODEL}",
+            "cross_region_profile": "${CCWB_CROSS_REGION_PROFILE}",
+            "enable_distribution": false
+          }
+          EOF
+          fi
+
+          # Install profile under the location ccwb expects.
+          mkdir -p "$HOME/.ccwb/profiles"
+          cp willdan/build-profile.json "$HOME/.ccwb/profiles/${CCWB_NAME}.json"
+          # Set as active.
+          cat > "$HOME/.ccwb/config.json" <<EOF
+          {"active_profile": "${CCWB_NAME}", "schema_version": "2.0"}
+          EOF
+
+      - name: Build package
+        working-directory: source
+        shell: bash
+        run: |
+          poetry run ccwb package \
+            --target-platform "${{ matrix.ccwb_platform }}"
+
+      - name: Locate built zip
+        id: locate
+        shell: bash
+        run: |
+          # ccwb package writes to source/dist/<profile>/<timestamp>/<platform>/...
+          zip_path=$(find source/dist -name '*.zip' -type f | head -n1)
+          if [ -z "$zip_path" ]; then
+            echo "::error::No zip found under source/dist/"
+            find source/dist -type f
+            exit 1
+          fi
+          echo "zip_path=$zip_path" >> "$GITHUB_OUTPUT"
+          echo "Built: $zip_path"
+
+      - name: Rename zip to stable name
+        shell: bash
+        run: |
+          cp "${{ steps.locate.outputs.zip_path }}" "${{ matrix.zip_name }}"
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip_name }}
+          path: ${{ matrix.zip_name }}
+          retention-days: 14
+
+      - name: Extract raw binaries for separate upload
+        shell: bash
+        run: |
+          # Extract credential-process and otel-helper from the zip and upload them
+          # individually too — easier to consume from nix flakes or scripts that don't
+          # want the whole zip.
+          mkdir -p raw
+          unzip -j "${{ matrix.zip_name }}" \
+            'claude-code-package/credential-process*' \
+            'claude-code-package/otel-helper*' \
+            -d raw/ || true
+          # Suffix each binary with platform target so multi-platform releases don't clash.
+          for f in raw/*; do
+            base=$(basename "$f")
+            mv "$f" "raw/${base%.*}-${{ matrix.target }}${f##*${base%.*}}"
+          done
+          ls -la raw/
+
+      - name: Upload raw binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ matrix.target }}
+          path: raw/
+          retention-days: 14
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          # Each zip artifact is a directory containing the zip; flatten.
+          find artifacts/ -type f \( -name '*.zip' -o -path '*raw*' \) -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Drafts let Alex review before publishing; flip to false once we're confident.
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

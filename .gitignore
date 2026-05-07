@@ -82,3 +82,10 @@ PARTITION_*.md
 FEEDBACK.md
 .claudeignore
 .mcp.json
+
+# Willdan build state — populated from CI secrets or filled locally for manual builds.
+# willdan/build-profile.example.json is the template that stays checked in.
+willdan/build-profile.json
+
+# nix build output symlink
+result
