@@ -1892,20 +1892,36 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     echo "   Click 'Always Allow' when prompted."
 fi
 
+# Parse arguments
+SIDE_BY_SIDE=false
+DEFAULT_LONGCONTEXT=false
+for arg in "$@"; do
+    case $arg in
+        --side-by-side) SIDE_BY_SIDE=true ;;
+        --default-longcontext) DEFAULT_LONGCONTEXT=true ;;
+    esac
+done
+
 # Copy Claude Code settings if present
 if [ -d "claude-settings" ]; then
     echo
-    echo "Installing Claude Code settings..."
-    mkdir -p ~/.claude
+    if [ "$SIDE_BY_SIDE" = true ]; then
+        # Install into isolated ~/.claude-bedrock so existing ~/.claude is untouched
+        CLAUDE_SETTINGS_DIR="$HOME/.claude-bedrock"
+        echo "Installing Claude Code Bedrock settings (side-by-side mode)..."
+    else
+        CLAUDE_SETTINGS_DIR="$HOME/.claude"
+        echo "Installing Claude Code settings..."
+    fi
+    mkdir -p "$CLAUDE_SETTINGS_DIR"
 
     # Copy settings and replace placeholders
     if [ -f "claude-settings/settings.json" ]; then
-        # Check if settings file already exists
-        if [ -f ~/.claude/settings.json ]; then
+        # Only prompt before overwriting in standard mode
+        if [ "$SIDE_BY_SIDE" = false ] && [ -f "$CLAUDE_SETTINGS_DIR/settings.json" ]; then
             echo "Existing Claude Code settings found"
             read -p "Overwrite with new settings? (Y/n): " -n 1 -r
             echo
-            # Default to Yes if user just presses enter (empty REPLY)
             if [[ -z "$REPLY" ]]; then
                 REPLY="y"
             fi
@@ -1916,12 +1932,48 @@ if [ -d "claude-settings" ]; then
         fi
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
-            # Replace placeholders and write settings
             sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
                 -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
-                "claude-settings/settings.json" > ~/.claude/settings.json
-            echo "✓ Claude Code settings configured"
+                "claude-settings/settings.json" > "$CLAUDE_SETTINGS_DIR/settings.json"
+
+            # Append [1m] suffix to Sonnet 4.6 and Opus 4.7 model IDs for 1M context window
+            if [ "$DEFAULT_LONGCONTEXT" = true ]; then
+                python3 -c "
+import json, sys
+path = '$CLAUDE_SETTINGS_DIR/settings.json'
+with open(path) as f:
+    s = json.load(f)
+eligible = {'anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-7'}
+for key in ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'):
+    val = s.get('env', {{}}).get(key, '')
+    if any(m in val for m in eligible) and not val.endswith('[1m]'):
+        s['env'][key] = val + '[1m]'
+with open(path, 'w') as f:
+    json.dump(s, f, indent=2)
+"
+                echo "✓ 1M token context window enabled (Sonnet 4.6 and Opus 4.7)"
+            fi
+
+            echo "✓ Claude Code settings installed to $CLAUDE_SETTINGS_DIR/settings.json"
         fi
+    fi
+
+    # In side-by-side mode, add a claude-bedrock alias to the user's shell config
+    if [ "$SIDE_BY_SIDE" = true ]; then
+        ALIAS_LINE="alias claude-bedrock='CLAUDE_CONFIG_DIR=\$HOME/.claude-bedrock claude'"
+        for RC_FILE in "$HOME/.zshrc" "$HOME/.bashrc"; do
+            if [ -f "$RC_FILE" ] && ! grep -q "claude-bedrock" "$RC_FILE"; then
+                echo "" >> "$RC_FILE"
+                echo "# Claude Code with Bedrock (side-by-side)" >> "$RC_FILE"
+                echo "$ALIAS_LINE" >> "$RC_FILE"
+                echo "✓ Added 'claude-bedrock' alias to $RC_FILE"
+            fi
+        done
+        echo
+        echo "Side-by-side setup complete:"
+        echo "  claude              → your existing Claude (Anthropic direct)"
+        echo "  claude-bedrock      → Claude via Bedrock"
+        echo "  (restart your terminal or run: source ~/.zshrc)"
     fi
 fi
 
@@ -2037,12 +2089,32 @@ echo
 REM Claude Code Authentication Installer for Windows
 REM Organization: {profile.provider_domain}
 REM Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+REM
+REM Usage:
+REM   install.bat                        -- standard install (overwrites .claude\\settings.json)
+REM   install.bat --side-by-side         -- installs to .claude-bedrock\\ and creates claude-bedrock.bat wrapper
+REM   install.bat --default-longcontext  -- appends [1m] to Sonnet 4.6 and Opus 4.7 model IDs
+
+setlocal enabledelayedexpansion
+
+REM Parse arguments
+set SIDE_BY_SIDE=false
+set DEFAULT_LONGCONTEXT=false
+for %%a in (%*) do (
+    if "%%a"=="--side-by-side" set SIDE_BY_SIDE=true
+    if "%%a"=="--default-longcontext" set DEFAULT_LONGCONTEXT=true
+)
 
 echo ======================================
 echo Claude Code Authentication Installer
 echo ======================================
 echo.
 echo Organization: {profile.provider_domain}
+if "!SIDE_BY_SIDE!"=="true" (
+    echo Mode: Side-by-side ^(existing Claude settings preserved^)
+) else (
+    echo Mode: Standard
+)
 echo.
 
 REM Check prerequisites
@@ -2083,64 +2155,86 @@ copy /Y "config.json" "%USERPROFILE%\\claude-code-with-bedrock\\" >nul
 
 REM Copy Claude Code settings if they exist
 if exist "claude-settings" (
-    echo Copying Claude Code telemetry settings...
-    if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
+    if "!SIDE_BY_SIDE!"=="true" (
+        REM Side-by-side: install to isolated .claude-bedrock directory
+        set "CLAUDE_SETTINGS_DIR=%USERPROFILE%\\.claude-bedrock"
+        echo Installing Bedrock settings to !CLAUDE_SETTINGS_DIR! ...
+    ) else (
+        REM Standard: install to default .claude directory
+        set "CLAUDE_SETTINGS_DIR=%USERPROFILE%\\.claude"
+        echo Installing Claude Code settings to !CLAUDE_SETTINGS_DIR! ...
+    )
 
-    REM Copy settings and replace placeholders
+    if not exist "!CLAUDE_SETTINGS_DIR!" mkdir "!CLAUDE_SETTINGS_DIR!"
+
     if exist "claude-settings\\settings.json" (
         set SKIP_SETTINGS=false
-        if exist "%USERPROFILE%\\.claude\\settings.json" (
-            echo Existing Claude Code settings found
-            set /p OVERWRITE="Overwrite with new settings? (y/n): "
-            if /i not "%OVERWRITE%"=="y" (
-                echo Skipping Claude Code settings...
-                set SKIP_SETTINGS=true
+
+        REM Only prompt before overwriting in standard mode
+        if "!SIDE_BY_SIDE!"=="false" (
+            if exist "!CLAUDE_SETTINGS_DIR!\\settings.json" (
+                echo Existing Claude Code settings found
+                set /p OVERWRITE="Overwrite with new settings? (y/n): "
+                if /i not "!OVERWRITE!"=="y" (
+                    echo Skipping Claude Code settings...
+                    set SKIP_SETTINGS=true
+                )
             )
         )
 
-        if not "%SKIP_SETTINGS%"=="true" (
+        if not "!SKIP_SETTINGS!"=="true" (
             REM Use PowerShell to replace placeholders
-            powershell -Command ^
-            "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            $credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            (Get-Content 'claude-settings\\\\settings.json') ^
-            -replace '__OTEL_HELPER_PATH__', $otelPath ^
-            -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | ^
-            Set-Content '%USERPROFILE%\\\\.claude\\\\settings.json'"
-            echo OK Claude Code settings configured
+            powershell -Command "$otelPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\otel-helper.exe' -replace '\\\\', '/'; $credPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\credential-process.exe' -replace '\\\\', '/'; $dest = Join-Path '!CLAUDE_SETTINGS_DIR!' 'settings.json'; (Get-Content 'claude-settings\\settings.json') -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | Set-Content $dest"
+
+            REM Append [1m] suffix to Sonnet 4.6 and Opus 4.7 model IDs for 1M context window
+            if "!DEFAULT_LONGCONTEXT!"=="true" (
+                powershell -Command "$path = Join-Path '!CLAUDE_SETTINGS_DIR!' 'settings.json'; $s = Get-Content $path -Raw | ConvertFrom-Json; $eligible = @('anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-7'); foreach ($key in @('ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_OPUS_MODEL')) {{ $val = $s.env.$key; if ($val -and ($eligible | Where-Object {{ $val -like ('*' + $_ + '*') }}) -and $val -notlike '*[1m]*') {{ $s.env.$key = $val + '[1m]' }} }}; $s | ConvertTo-Json -Depth 10 | Set-Content $path"
+                echo OK 1M token context window enabled ^(Sonnet 4.6 and Opus 4.7^)
+            )
+
+            echo OK Claude Code settings installed to !CLAUDE_SETTINGS_DIR!\\settings.json
         )
+    )
+
+    REM In side-by-side mode, create claude-bedrock.bat and claude-bedrock.ps1 wrappers
+    if "!SIDE_BY_SIDE!"=="true" (
+        echo Creating claude-bedrock wrappers...
+
+        REM .bat wrapper for cmd.exe
+        set WRAPPER=%USERPROFILE%\\claude-code-with-bedrock\\claude-bedrock.bat
+        echo @echo off > "!WRAPPER!"
+        echo set "CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude-bedrock" >> "!WRAPPER!"
+        echo claude %%* >> "!WRAPPER!"
+
+        REM .ps1 wrapper for PowerShell
+        set PS1WRAPPER=%USERPROFILE%\\claude-code-with-bedrock\\claude-bedrock.ps1
+        powershell -Command "Set-Content -Path '%USERPROFILE%\\claude-code-with-bedrock\\claude-bedrock.ps1' -Value '$env:CLAUDE_CONFIG_DIR = [System.Environment]::GetEnvironmentVariable(\"USERPROFILE\") + \"\.claude-bedrock\"; & claude @args'"
+
+        REM Add claude-code-with-bedrock to user PATH if not already present
+        powershell -Command "$p = [Environment]::GetEnvironmentVariable('PATH','User'); $d = $env:USERPROFILE + '\\claude-code-with-bedrock'; if ($p -notlike ('*' + $d + '*')) {{ [Environment]::SetEnvironmentVariable('PATH', $p + ';' + $d, 'User'); Write-Host 'OK Added claude-code-with-bedrock to user PATH' }} else {{ Write-Host 'OK claude-code-with-bedrock already in PATH' }}"
+
+        echo.
+        echo Side-by-side setup complete:
+        echo   claude              --^> your existing Claude ^(Anthropic direct^)
+        echo   claude-bedrock      --^> Claude via Bedrock
+        echo   ^(restart your terminal for PATH changes to take effect^)
     )
 )
 
-REM Configure AWS profiles
+REM Configure AWS profiles by writing ~/.aws/config directly (no AWS CLI dependency)
 echo.
 echo Configuring AWS profiles...
 
-REM Read profiles from config.json using PowerShell
-for /f %%p in ('powershell -Command ^
-"& {{$c=Get-Content config.json|ConvertFrom-Json;$c.PSObject.Properties.Name}}"') do (
-    echo Configuring AWS profile: %%p
+if not exist "%USERPROFILE%\\.aws" mkdir "%USERPROFILE%\\.aws"
 
-    REM Get profile-specific region
-    for /f %%r in ('powershell -Command ^
-    "& {{$c=Get-Content config.json|ConvertFrom-Json;$c.'%%p'.aws_region}}"') do set PROFILE_REGION=%%r
+REM Purge any stale stanza from credentials file to avoid shadowing credential_process
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $awsCreds = Join-Path $env:USERPROFILE '.aws\\credentials'; if (Test-Path $awsCreds) {{ $cfg = Get-Content config.json | ConvertFrom-Json; $existing = Get-Content $awsCreds -Raw; foreach ($p in $cfg.PSObject.Properties.Name) {{ $pattern = '(?ms)^\\[' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, '') }}; Set-Content -Path $awsCreds -Value $existing.TrimStart() -NoNewline -Encoding ASCII }}"
 
-
-    REM Set credential process with --profile flag (cross-platform, no wrapper needed)
-    aws configure set credential_process ^
-    "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe --profile %%p" --profile %%p
-
-
-    REM Set region
-    if defined PROFILE_REGION (
-        aws configure set region !PROFILE_REGION! --profile %%p
-    ) else (
-        aws configure set region {profile.aws_region} --profile %%p
-    )
-
-    echo   OK Created AWS profile '%%p'
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $nl = [char]13 + [char]10; $cfg = Get-Content config.json | ConvertFrom-Json; $awsConfig = Join-Path $env:USERPROFILE '.aws\\config'; $credProcess = Join-Path $env:USERPROFILE 'claude-code-with-bedrock\\credential-process.exe'; $existing = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}; if (-not $existing) {{ $existing = '' }}; foreach ($p in $cfg.PSObject.Properties.Name) {{ $region = $cfg.$p.aws_region; if (-not $region) {{ $region = '{profile.aws_region}' }}; $pattern = '(?ms)^\\[profile ' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, ''); $stanza = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl; $existing = $existing.TrimEnd() + $nl + $nl + $stanza; Write-Host ('  OK Configured AWS profile ' + $p) }}; Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII"
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to configure AWS profiles
+    pause
+    exit /b 1
 )
 
 echo.
@@ -2149,20 +2243,8 @@ echo Installation complete!
 echo ======================================
 echo.
 echo Available profiles:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name"') do (
+for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | ConvertFrom-Json).PSObject.Properties.Name"') do (
     echo   - %%p
-)
-echo.
-echo To use Claude Code authentication:
-echo   set AWS_PROFILE=^<profile-name^>
-echo   aws sts get-caller-identity
-echo.
-echo Example:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name | Select-Object -First 1"') do (
-    echo   set AWS_PROFILE=%%p
-    echo   aws sts get-caller-identity
 )
 echo.
 echo Note: Authentication will automatically open your browser when needed.
