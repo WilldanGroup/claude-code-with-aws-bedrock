@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -106,11 +107,19 @@ class PackageCommand(Command):
             # Use the selected platforms (guaranteed to have at least one due to validation)
             target_platform = selected_platforms if len(selected_platforms) > 1 else selected_platforms[0]
 
-        # Prompt for co-authorship preference (default to No - opt-in approach)
-        include_coauthored_by = questionary.confirm(
-            "Include 'Co-Authored-By: Claude' in git commits?",
-            default=False,
-        ).ask()
+        # Prompt for co-authorship preference (default to No - opt-in approach).
+        # Honor CCWB_INCLUDE_COAUTHOR env var, or skip the prompt entirely on non-TTY
+        # stdin (CI runners) so `ccwb package` is scriptable.
+        coauthor_env = os.environ.get("CCWB_INCLUDE_COAUTHOR")
+        if coauthor_env is not None:
+            include_coauthored_by = coauthor_env.strip().lower() in ("1", "true", "yes", "y", "on")
+        elif not sys.stdin.isatty():
+            include_coauthored_by = False
+        else:
+            include_coauthored_by = questionary.confirm(
+                "Include 'Co-Authored-By: Claude' in git commits?",
+                default=False,
+            ).ask()
 
         # Validate platform
         valid_platforms = ["macos", "macos-arm64", "macos-intel", "linux", "linux-x64", "linux-arm64", "windows", "all"]
