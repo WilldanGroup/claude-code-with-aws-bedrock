@@ -1,0 +1,17 @@
+{
+  "_comment": "Sample build profile for ccwb package. Copy to willdan/build-profile.json and fill in real values, OR populate via repo secrets in .github/workflows/willdan-build-release.yml. Cognito tenant identifiers below are not secrets — they're public identifiers baked into every distributed binary — but check Willdan IT policy before committing.",
+  "name": "willdan",
+  "schema_version": "2.0",
+  "provider_domain": "claudecode-dev.auth.us-east-1.amazoncognito.com",
+  "client_id": "REPLACE_WITH_COGNITO_CLIENT_ID",
+  "credential_storage": "session",
+  "aws_region": "us-east-1",
+  "identity_pool_name": "REPLACE_WITH_IDENTITY_POOL_NAME",
+  "provider_type": "cognito",
+  "cognito_user_pool_id": "REPLACE_WITH_USER_POOL_ID",
+  "selected_model": "us.anthropic.claude-sonnet-4-6",
+  "cross_region_profile": "us",
+  "enable_distribution": false,
+  "monitoring_enabled": true,
+  "analytics_enabled": true
+}
