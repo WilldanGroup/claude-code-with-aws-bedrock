@@ -29,9 +29,14 @@ on:
 
 permissions:
   contents: write  # needed to create releases and upload assets
+  id-token: write  # needed for OIDC federation to AWS
 
 env:
   PYTHON_VERSION: '3.12'
+  # Provisioned by WilldanGroup/aws-bootstrap via cdk/config/catalog.ts.
+  # Trust policy scopes assumption to this repo's tag pushes (willdan-v*-*)
+  # and workflow_dispatch runs.
+  AWS_DEPLOY_ROLE_ARN: arn:aws:iam::459120389451:role/gha-deploy-WilldanGroup-claude-code-with-aws-bedrock-dev
 
 jobs:
   build:
@@ -85,6 +90,13 @@ jobs:
       - name: Install dependencies
         working-directory: source
         run: poetry install --no-root
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: ccwb-package-${{ matrix.target }}-${{ github.run_id }}
+          aws-region: ${{ secrets.CCWB_AWS_REGION || 'us-east-1' }}
 
       - name: Generate build profile
         shell: bash
