@@ -20,6 +20,9 @@ venv/
 # IDE
 .vscode/
 .idea/
+.stubs/
+.vfsmeta/
+.work-folder-info
 
 # OS
 Thumbs.db
