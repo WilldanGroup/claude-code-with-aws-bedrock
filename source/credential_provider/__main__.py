@@ -95,9 +95,10 @@ class MultiProviderAuth:
             )
         self.provider_config = PROVIDER_CONFIGS[self.provider_type]
 
-        # OAuth configuration
-        self.redirect_port = int(os.getenv("REDIRECT_PORT", "8400"))
-        self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
+        # OAuth configuration - port selection deferred until authentication
+        self.preferred_port = int(os.getenv("REDIRECT_PORT", "8400"))
+        self.redirect_port = None
+        self.redirect_uri = None
 
         # Initialize credential storage
         self._init_credential_storage()
@@ -106,6 +107,31 @@ class MultiProviderAuth:
         """Print debug message only if debug mode is enabled"""
         if self.debug:
             print(f"Debug: {message}", file=sys.stderr)
+
+    def _get_available_port(self):
+        """Find an available port for OAuth callback, preferring the configured port."""
+        if self.redirect_port is not None:
+            return self.redirect_port
+
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            test_socket.bind(("127.0.0.1", self.preferred_port))
+            test_socket.close()
+            self.redirect_port = self.preferred_port
+        except OSError as e:
+            test_socket.close()
+            if e.errno == errno.EADDRINUSE:
+                self._debug_print(f"Port {self.preferred_port} in use, selecting available port")
+                auto_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                auto_socket.bind(("127.0.0.1", 0))
+                self.redirect_port = auto_socket.getsockname()[1]
+                auto_socket.close()
+                self._debug_print(f"Using port {self.redirect_port} for OAuth callback")
+            else:
+                raise
+
+        self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
+        return self.redirect_port
 
     def _auto_detect_profile(self):
         """Auto-detect profile name from config.json when only one profile exists."""
@@ -491,23 +517,27 @@ class MultiProviderAuth:
         except Exception as e:
             self._debug_print(f"Could not clear keyring monitoring token: {e}")
 
-        # Clear credentials file (for session storage mode)
-        try:
-            credentials_path = Path.home() / ".aws" / "credentials"
-            if credentials_path.exists():
-                # Replace with expired dummy credentials instead of deleting
-                # This preserves the file for other profiles
-                expired_creds = {
-                    "Version": 1,
-                    "AccessKeyId": "EXPIRED",
-                    "SecretAccessKey": "EXPIRED",
-                    "SessionToken": "EXPIRED",
-                    "Expiration": "2000-01-01T00:00:00Z",
-                }
-                self.save_to_credentials_file(expired_creds, self.profile)
-                cleared_items.append("credentials file")
-        except Exception as e:
-            self._debug_print(f"Could not clear credentials file: {e}")
+        # Clear credentials file (for session storage mode only).
+        # Writing an EXPIRED stanza in keyring mode would shadow the profile's
+        # credential_process entry in ~/.aws/config (shared-credentials-file
+        # resolves before credential_process in the boto3 credential chain),
+        # which breaks Cowork Desktop's inferenceBedrockProfile lookup with
+        # a 403 InvalidClientTokenId.
+        if self.credential_storage == "session":
+            try:
+                credentials_path = Path.home() / ".aws" / "credentials"
+                if credentials_path.exists():
+                    expired_creds = {
+                        "Version": 1,
+                        "AccessKeyId": "EXPIRED",
+                        "SecretAccessKey": "EXPIRED",
+                        "SessionToken": "EXPIRED",
+                        "Expiration": "2000-01-01T00:00:00Z",
+                    }
+                    self.save_to_credentials_file(expired_creds, self.profile)
+                    cleared_items.append("credentials file")
+            except Exception as e:
+                self._debug_print(f"Could not clear credentials file: {e}")
 
         # Clear monitoring token from session directory
         session_dir = Path.home() / ".claude-code-session"
@@ -526,6 +556,58 @@ class MultiProviderAuth:
                 pass
 
         return cleared_items
+
+    def _clear_sts_credentials(self):
+        """Clear only STS credentials cache, preserving monitoring token for silent refresh."""
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    for entry in [
+                        f"{self.profile}-keys",
+                        f"{self.profile}-token1",
+                        f"{self.profile}-token2",
+                        f"{self.profile}-meta",
+                    ]:
+                        if keyring.get_password("claude-code-with-bedrock", entry):
+                            if "keys" in entry:
+                                expired_data = json.dumps({"AccessKeyId": "EXPIRED", "SecretAccessKey": "EXPIRED"})
+                            elif "meta" in entry:
+                                expired_data = json.dumps({"Version": 1, "Expiration": "2000-01-01T00:00:00Z"})
+                            else:
+                                expired_data = "EXPIRED"
+                            keyring.set_password("claude-code-with-bedrock", entry, expired_data)
+                else:
+                    if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-credentials"):
+                        expired_credential = json.dumps({
+                            "Version": 1,
+                            "AccessKeyId": "EXPIRED",
+                            "SecretAccessKey": "EXPIRED",
+                            "SessionToken": "EXPIRED",
+                            "Expiration": "2000-01-01T00:00:00Z",
+                        })
+                        keyring.set_password(
+                            "claude-code-with-bedrock", f"{self.profile}-credentials", expired_credential
+                        )
+            # Clear session file credentials (but NOT monitoring token file)
+            session_dir = Path.home() / ".claude-code-session"
+            creds_file = session_dir / f"{self.profile}-credentials.json"
+            if creds_file.exists():
+                creds_file.unlink()
+
+            # For session storage mode, also clear ~/.aws/credentials
+            if self.credential_storage == "session":
+                expired_creds = {
+                    "Version": 1,
+                    "AccessKeyId": "EXPIRED",
+                    "SecretAccessKey": "EXPIRED",
+                    "SessionToken": "EXPIRED",
+                    "Expiration": "2000-01-01T00:00:00Z",
+                }
+                self.save_to_credentials_file(expired_creds, self.profile)
+
+            self._debug_print("Cleared STS credentials (monitoring token preserved)")
+        except Exception as e:
+            self._debug_print(f"Could not clear STS credentials: {e}")
 
     def save_monitoring_token(self, id_token, token_claims):
         """Save ID token for monitoring authentication"""
@@ -823,6 +905,8 @@ class MultiProviderAuth:
 
     def authenticate_oidc(self):
         """Perform OIDC authentication with PKCE"""
+        self._get_available_port()
+
         state = secrets.token_urlsafe(16)
         nonce = secrets.token_urlsafe(16)
 
@@ -1261,69 +1345,11 @@ class MultiProviderAuth:
                 ) from e
             raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
 
-    def _wait_for_auth_completion(self, timeout=60):
-        """Wait for another process to complete authentication using port-based detection"""
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            # Check if port is still in use (another auth in progress)
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # Port is free, auth must have completed or failed
-                # Check for cached credentials
-                cached = self.get_cached_credentials()
-                if cached:
-                    return cached
-                else:
-                    # Auth failed or was cancelled
-                    return None
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    # Port still in use, auth still in progress
-                    time.sleep(0.5)
-                else:
-                    # Other error
-                    raise
-            finally:
-                try:
-                    test_socket.close()
-                except Exception:
-                    pass
-
-        return None
-
     def authenticate_for_monitoring(self):
         """Authenticate specifically for monitoring token (no AWS credential output)"""
         try:
-            # Try to acquire port lock by testing if we can bind to it
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # We got the port, we can proceed with authentication
-                self._debug_print("Port available, proceeding with monitoring authentication")
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    # Port in use, another auth is in progress
-                    self._debug_print("Another authentication is in progress, waiting...")
-                    test_socket.close()
-
-                    # Wait for the other process to complete
-                    # After waiting, check if we now have a monitoring token
-                    self._wait_for_auth_completion()
-                    token = self.get_monitoring_token()
-                    if token:
-                        return token
-                    else:
-                        self._debug_print("Authentication timeout or failed in another process")
-                        return None
-                else:
-                    test_socket.close()
-                    raise
-
             # Authenticate with OIDC provider
+            # Note: Port selection is handled dynamically in authenticate_oidc()
             self._debug_print(f"Authenticating with {self.provider_config['name']} for monitoring token...")
             id_token, token_claims = self.authenticate_oidc()
 
@@ -1591,6 +1617,10 @@ class MultiProviderAuth:
         # Show browser notification
         self._show_quota_browser_notification(quota_result, is_blocked=True)
 
+        # Clear cached STS credentials so next call goes through refresh path
+        # which always re-checks quota (no interval bypass)
+        self._clear_sts_credentials()
+
         return 1
 
     def _show_quota_browser_notification(self, quota_result: dict, is_blocked: bool = False):
@@ -1792,7 +1822,7 @@ class MultiProviderAuth:
                     pass  # Suppress logs
 
             # Use a different port for quota page (8401) to avoid conflict with auth
-            quota_port = self.redirect_port + 1
+            quota_port = self.preferred_port + 1
             try:
                 server = HTTPServer(("127.0.0.1", quota_port), QuotaPageHandler)
                 server.timeout = 5  # 5 second timeout
@@ -1818,7 +1848,7 @@ class MultiProviderAuth:
         Args:
             quota_result: Result from quota check API
         """
-        usage = quota_result.get("usage", {})
+        usage = quota_result.get("usage") or {}
         monthly_percent = usage.get("monthly_percent", 0)
         daily_percent = usage.get("daily_percent", 0)
 
@@ -1895,39 +1925,6 @@ class MultiProviderAuth:
                 print(json.dumps(cached))  # noqa: S105
                 return 0
 
-            # Try to acquire port lock by testing if we can bind to it
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
-                test_socket.close()
-                # We got the port, we can proceed with authentication
-                self._debug_print("Port available, proceeding with authentication")
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    # Port in use, another auth is in progress
-                    self._debug_print("Another authentication is in progress, waiting...")
-                    test_socket.close()
-
-                    # Wait for the other process to complete
-                    cached = self._wait_for_auth_completion()
-                    if cached:
-                        print(json.dumps(cached))
-                        return 0
-                    else:
-                        # Only print error to stderr for actual failures
-                        self._debug_print("Authentication timeout or failed in another process")
-                        return 1
-                else:
-                    test_socket.close()
-                    raise
-
-            # Check cache again (another process might have just finished)
-            cached = self.get_cached_credentials()
-            if cached:
-                # Output cached credentials (intended behavior for AWS CLI)
-                print(json.dumps(cached))  # noqa: S105
-                return 0
-
             # Try silent refresh using cached id_token before opening browser
             silent_creds, id_token, token_claims = self._try_silent_refresh()
             if silent_creds:
@@ -1981,12 +1978,17 @@ class MultiProviderAuth:
             # User cancelled - no output needed
             return 1
         except Exception as e:
+            import traceback
             error_msg = str(e)
             # Only print actual errors to stderr
             if "timeout" not in error_msg.lower():
                 print(f"Error: {error_msg}", file=sys.stderr)
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
             else:
                 self._debug_print(f"Error: {error_msg}")
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
 
             # Provide specific guidance for common errors
             if "NotAuthorizedException" in error_msg and "Token is not from a supported provider" in error_msg:
@@ -2008,6 +2010,7 @@ class MultiProviderAuth:
 def main():
     """CLI entry point"""
     import argparse
+    import traceback
 
     parser = argparse.ArgumentParser(description="AWS credential provider for OIDC + Cognito Identity Pool")
     # Check environment variable first, then use default
@@ -2139,4 +2142,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
